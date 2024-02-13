@@ -238,6 +238,7 @@ jobs:
           if [[ -n "${IMAGE_TAG_LATEST}" ]]; then
           echo "${REGISTRY}/${IMAGE_TAG_LATEST}         ${REGISTRY}/${IMAGE_TAG_FULL_AMD64} ${REGISTRY}/${IMAGE_TAG_FULL_ARM64}" >> manifest.list
           fi
+          cat manifest.list
           while read manifest; do
             docker manifest create $(awk '{print $1}' <<< ${manifest}) $(awk '{print $2}' <<< ${manifest}) $(awk '{print $3}' <<< ${manifest})
           done < manifest.list
