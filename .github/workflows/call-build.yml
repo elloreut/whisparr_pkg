@@ -7,6 +7,376 @@ on:
       - 'master'
 
 jobs:
-  call:
-    uses: elloreut/build-workflow/.github/workflows/build-on-call.yml@master
-    secrets: inherit
+
+  shellcheck:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check All "run*" Files
+        run: |
+          for file in $(find ./root/etc -type f -name "run*"); do
+            echo "Checking: $file"
+            shellcheck "$file"
+          done
+
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        architecture: [linux-arm64, linux-amd64]
+    needs: [shellcheck]
+    outputs:
+      version:                  ${{ steps.prep.outputs.version }}
+      is-latest:                ${{ steps.prep.outputs.is-latest }}
+      description:              ${{ steps.prep.outputs.description }}
+      hide:                     ${{ steps.prep.outputs.hide }}
+      image-tag-full-amd64:     ${{ steps.prep.outputs.image-tag-full-amd64 }}
+      image-tag-full-arm64:     ${{ steps.prep.outputs.image-tag-full-arm64 }}
+      image-tag-latest:         ${{ steps.prep.outputs.image-tag-latest }}
+      image-tag-branch:         ${{ steps.prep.outputs.image-tag-branch }}
+      image-tag-branch-version: ${{ steps.prep.outputs.image-tag-branch-version }}
+      image-tag-branch-sha:     ${{ steps.prep.outputs.image-tag-branch-sha }}
+      package-version:          ${{ steps.prep.outputs.package-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if Architecture Exists
+        id: arch-exists
+        run: |
+          (test -f ${{ matrix.architecture }}.Dockerfile && echo "result=ok" >> $GITHUB_OUTPUT) || echo "result=nok" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        if: (steps.arch-exists.outputs.result == 'ok')
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: (steps.arch-exists.outputs.result == 'ok')
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to docker.io
+        if: (steps.arch-exists.outputs.result == 'ok')
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io
+        if: (steps.arch-exists.outputs.result == 'ok')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Outputs for Next Steps
+        if: (steps.arch-exists.outputs.result == 'ok')
+        id: prep
+        env:
+          ARCHITECTURE:     ${{ matrix.architecture }}
+          BRANCH:           ${{ github.ref_name }}
+          RUN_NUMBER:       ${{ github.run_number }}
+          REPOSITORY:       ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          SHA:              ${{ github.sha }}
+          SERVER_URL:       ${{ github.server_url }}
+        run: |
+          VERSION=$(jq -r '.version // empty' < VERSION.json)
+          VERSION=${VERSION//\~/-}
+          [[ -z ${VERSION} ]] && VERSION=$(date --utc --date=@$(git show -s --format=%ct $(git rev-parse --short HEAD)) +'%Y%m%d%H%M%S')
+          PR_BRANCH=$(jq -r '.branch // empty' < VERSION.json)
+          [[ -n ${PR_BRANCH} ]] && PR_BRANCH=-${PR_BRANCH}
+          echo "is-latest=$(jq -r '.latest // false' < VERSION.json)" >> $GITHUB_OUTPUT
+          echo "description=$(jq -r '.description // empty' < VERSION.json)" >> $GITHUB_OUTPUT
+          echo "hide=$(jq -r '.hide // false' < VERSION.json)" >> $GITHUB_OUTPUT
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')" >> $GITHUB_OUTPUT
+          echo "revision=${SHA}" >> $GITHUB_OUTPUT
+          echo "source=${SERVER_URL}/${REPOSITORY}/tree/${BRANCH}" >> $GITHUB_OUTPUT
+          echo "vendor=${REPOSITORY_OWNER}" >> $GITHUB_OUTPUT
+          echo "url=https://hotio.dev/containers/${REPOSITORY/${REPOSITORY_OWNER}\//}" >> $GITHUB_OUTPUT
+          echo "platform=${ARCHITECTURE//-/\/}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "package-version=${BRANCH}-${SHA:0:7}" >> $GITHUB_OUTPUT
+          echo "image-tag-cache=${REPOSITORY}:${BRANCH}${PR_BRANCH}-buildcache-${ARCHITECTURE}" >> $GITHUB_OUTPUT
+          echo "image-tag-full=${REPOSITORY}:${BRANCH}${PR_BRANCH}-${SHA:0:7}-${RUN_NUMBER}-${ARCHITECTURE}" >> $GITHUB_OUTPUT
+          echo "image-tag-full-${ARCHITECTURE/linux-/}=${REPOSITORY}:${BRANCH}${PR_BRANCH}-${SHA:0:7}-${RUN_NUMBER}-${ARCHITECTURE}" >> $GITHUB_OUTPUT
+          echo "image-tag-branch=${REPOSITORY}:${BRANCH}${PR_BRANCH}" >> $GITHUB_OUTPUT
+          echo "image-tag-branch-version=${REPOSITORY}:${BRANCH}${PR_BRANCH}-${VERSION}" >> $GITHUB_OUTPUT
+          echo "image-tag-branch-sha=${REPOSITORY}:${BRANCH}${PR_BRANCH}-${SHA:0:7}" >> $GITHUB_OUTPUT
+          [[ $(jq -r '.latest // empty' < VERSION.json) == true ]] && echo "image-tag-latest=${REPOSITORY}:latest" >> $GITHUB_OUTPUT
+          [[ ${ARCHITECTURE} == linux-amd64 ]] && [[ $(jq -r '.test_amd64' < VERSION.json) == true ]] && echo "do_smoketest=ok" >> $GITHUB_OUTPUT
+          [[ ${ARCHITECTURE} == linux-arm64 ]] && [[ $(jq -r '.test_arm64' < VERSION.json) == true ]] && echo "do_smoketest=ok" >> $GITHUB_OUTPUT
+          echo 'build-args<<EOF' >> $GITHUB_OUTPUT
+            jq -r 'to_entries[] | [(.key | ascii_upcase),.value] | join("=")' < VERSION.json >> $GITHUB_OUTPUT
+            echo "BUILD_ARCHITECTURE=${ARCHITECTURE}" >> $GITHUB_OUTPUT
+            echo "PACKAGE_VERSION=${BRANCH}-${SHA:0:7}" >> $GITHUB_OUTPUT
+            echo "IMAGE_STATS=$(jq '.app = "'"${REPOSITORY/${REPOSITORY_OWNER}\//}"'" | .image = "'"${REPOSITORY}:${BRANCH}${PR_BRANCH}"'" | .revision = "'"${SHA:0:7}"'" | .version = "'"${VERSION}"'"' <<< "{}" | base64 -w 0)" >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+
+      - name: Build Image
+        if: (steps.arch-exists.outputs.result == 'ok')
+        uses: docker/build-push-action@v5
+        with:
+          provenance: false
+          load: true
+          platforms: ${{ steps.prep.outputs.platform }}
+          file: ./${{ matrix.architecture }}.Dockerfile
+          cache-from: type=registry,ref=${{ steps.prep.outputs.image-tag-cache }}
+          cache-to: type=registry,ref=${{ steps.prep.outputs.image-tag-cache }},mode=max
+          tags: ${{ steps.prep.outputs.image-tag-full }}
+          build-args: |
+            ${{ steps.prep.outputs.build-args }}
+
+      - name: List Packages
+        if: (steps.arch-exists.outputs.result == 'ok')
+        env:
+          IMAGE:           ${{ steps.prep.outputs.image-tag-full }}
+          PACKAGE_VERSION: ${{ steps.prep.outputs.package-version }}
+          PLATFORM:        ${{ steps.prep.outputs.platform }}
+        run: |
+          docker run --platform="${PLATFORM}" --rm --entrypoint="" -v ${GITHUB_WORKSPACE}:/logs -e LOG="/logs/${PACKAGE_VERSION}-packages.log" "${IMAGE}" bash -c 'if grep -q alpine < /etc/os-release; then apk -vv info | sort > ${LOG} 2>&1; else apt list --installed > ${LOG} 2>&1; fi'
+          
+      - name: Smoke Test
+        if: (steps.arch-exists.outputs.result == 'ok') && (steps.prep.outputs.do_smoketest == 'ok')
+        id: smoketest
+        env:
+          IMAGE:           ${{ steps.prep.outputs.image-tag-full }}
+          PACKAGE_VERSION: ${{ steps.prep.outputs.package-version }}
+          PLATFORM:        ${{ steps.prep.outputs.platform }}
+        run: |
+          test_url=$(jq -r '.test_url' < VERSION.json)
+          exitcode=0
+          docker run --platform="${PLATFORM}" --network host -d --name service "${IMAGE}"
+          curl -fsSL --retry-all-errors --retry 60 --retry-max-time 120 -m 10 -b /dev/shm/cookie "${test_url}" --output /dev/null || exitcode=$?
+          docker logs service > "${PACKAGE_VERSION}-test.log" 2>&1
+          [[ ${exitcode} == 0 ]] && echo "result=ok" >> $GITHUB_OUTPUT || echo "result=nok" >> $GITHUB_OUTPUT
+          exit ${exitcode}
+
+      - name: Take Screenshot
+        if: (steps.arch-exists.outputs.result == 'ok') && (steps.prep.outputs.do_smoketest == 'ok')
+        env:
+          PACKAGE_VERSION: ${{ steps.prep.outputs.package-version }}
+        run: |
+          docker pull -q elestio/ws-screenshot.slim:latest
+          docker run --rm --network host -d --rm elestio/ws-screenshot.slim:latest node ./index.js -r . -p 1025 --oc 1
+          test_url=$(jq -r '.test_url' < VERSION.json)
+          curl -fsSL --retry-all-errors --retry 60 --retry-max-time 120 -m 10 "http://localhost:1025" --output /dev/null
+          curl -fsSL "http://localhost:1025/api/screenshot?resX=1920&resY=1080&outFormat=png&isFullPage=false&waitTime=10000&dismissModals=true&url=${test_url}" --output "${PACKAGE_VERSION}-screenshot.png"
+
+      - name: Push Image
+        if: (steps.arch-exists.outputs.result == 'ok')
+        uses: docker/build-push-action@v5
+        with:
+          provenance: false
+          push: true
+          platforms: ${{ steps.prep.outputs.platform }}
+          file: ./${{ matrix.architecture }}.Dockerfile
+          tags: |
+            docker.io/${{ steps.prep.outputs.image-tag-full }}
+            ghcr.io/${{ steps.prep.outputs.image-tag-full }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.prep.outputs.created }}
+            org.opencontainers.image.title=${{ steps.prep.outputs.image-tag-branch }}
+            org.opencontainers.image.revision=${{ steps.prep.outputs.revision }}
+            org.opencontainers.image.source=${{ steps.prep.outputs.source }}
+            org.opencontainers.image.vendor=${{ steps.prep.outputs.vendor }}
+            org.opencontainers.image.url=${{ steps.prep.outputs.url }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.version }}
+          build-args: |
+            ${{ steps.prep.outputs.build-args }}
+
+      - name: Upload Results
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: warn
+          name: ${{ steps.prep.outputs.package-version }}-results-${{ matrix.architecture }}
+          path: |
+            ${{ steps.prep.outputs.package-version }}-*.*
+
+  publish:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        registry: [docker.io, ghcr.io]
+    needs: [build]
+    steps:
+      - name: Login to docker.io
+        if: (matrix.registry == 'docker.io')
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io
+        if: (matrix.registry == 'ghcr.io')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Manifests
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enabled
+          IMAGE_TAG_FULL_AMD64:     ${{ needs.build.outputs.image-tag-full-amd64 }}
+          IMAGE_TAG_FULL_ARM64:     ${{ needs.build.outputs.image-tag-full-arm64 }}
+          IMAGE_TAG_LATEST:         ${{ needs.build.outputs.image-tag-latest }}
+          IMAGE_TAG_BRANCH:         ${{ needs.build.outputs.image-tag-branch }}
+          IMAGE_TAG_BRANCH_VERSION: ${{ needs.build.outputs.image-tag-branch-version }}
+          IMAGE_TAG_BRANCH_SHA:     ${{ needs.build.outputs.image-tag-branch-sha }}
+          REGISTRY:                 ${{ matrix.registry }}
+        run: |
+          echo "${REGISTRY}/${IMAGE_TAG_BRANCH}         ${REGISTRY}/${IMAGE_TAG_FULL_AMD64} ${REGISTRY}/${IMAGE_TAG_FULL_ARM64}" >> manifest.list
+          echo "${REGISTRY}/${IMAGE_TAG_BRANCH_VERSION} ${REGISTRY}/${IMAGE_TAG_FULL_AMD64} ${REGISTRY}/${IMAGE_TAG_FULL_ARM64}" >> manifest.list
+          echo "${REGISTRY}/${IMAGE_TAG_BRANCH_SHA}     ${REGISTRY}/${IMAGE_TAG_FULL_AMD64} ${REGISTRY}/${IMAGE_TAG_FULL_ARM64}" >> manifest.list
+          if [[ -n "${IMAGE_TAG_LATEST}" ]]; then
+          echo "${REGISTRY}/${IMAGE_TAG_LATEST}         ${REGISTRY}/${IMAGE_TAG_FULL_AMD64} ${REGISTRY}/${IMAGE_TAG_FULL_ARM64}" >> manifest.list
+          fi
+          while read manifest; do
+            docker manifest create $(awk '{print $1}' <<< ${manifest}) $(awk '{print $2}' <<< ${manifest}) $(awk '{print $3}' <<< ${manifest})
+          done < manifest.list
+
+      - name: Push Manifests
+        uses: nick-fields/retry@v3
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enabled
+        with:
+          max_attempts: 3
+          timeout_minutes: 5
+          retry_wait_seconds: 30
+          command: |
+            while read manifest; do
+              docker manifest push $(awk '{print $1}' <<< ${manifest})
+            done < manifest.list
+
+  tags:
+    runs-on: ubuntu-22.04
+    needs: [build, publish]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Update "tags.json" File
+        uses: nick-fields/retry@v3
+        env:
+          RUN_ID:                   ${{ github.run_id }}
+          REPOSITORY:               ${{ github.repository }}
+          SERVER_URL:               ${{ github.server_url }}
+          IS_LATEST:                ${{ needs.build.outputs.is-latest }}
+          DESCRIPTION:              ${{ needs.build.outputs.description }}
+          HIDE:                     ${{ needs.build.outputs.hide }}
+          IMAGE_TAG_BRANCH:         ${{ needs.build.outputs.image-tag-branch }}
+          IMAGE_TAG_BRANCH_VERSION: ${{ needs.build.outputs.image-tag-branch-version }}
+          IMAGE_TAG_BRANCH_SHA:     ${{ needs.build.outputs.image-tag-branch-sha }}
+        with:
+          max_attempts: 3
+          timeout_minutes: 5
+          retry_wait_seconds: 30
+          command: |
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            IMAGE_TAG_BRANCH=${IMAGE_TAG_BRANCH/$REPOSITORY:/}
+            IMAGE_TAG_BRANCH_VERSION=${IMAGE_TAG_BRANCH_VERSION/$REPOSITORY:/}
+            IMAGE_TAG_BRANCH_SHA=${IMAGE_TAG_BRANCH_SHA/$REPOSITORY:/}
+            [[ ! -f tags.json ]] && echo "{}" > tags.json
+            json=$(cat tags.json)
+            jq --sort-keys \
+                --arg tag                            "${IMAGE_TAG_BRANCH}" \
+                --arg image_tag_branch_value         "${IMAGE_TAG_BRANCH}" \
+                --arg image_tag_branch_version_value "${IMAGE_TAG_BRANCH_VERSION}" \
+                --arg image_tag_branch_sha_value     "${IMAGE_TAG_BRANCH_SHA}" \
+                --arg last_updated                   "$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')" \
+                --arg last_updated_url               "${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}" \
+                --argjson latest                     "${IS_LATEST}" \
+                --arg description                    "${DESCRIPTION}" \
+                --argjson hide                       "${HIDE}" \
+                '.[$tag].tags[0] = $image_tag_branch_value | .[$tag].tags[1] = $image_tag_branch_version_value | .[$tag].tags[2] = $image_tag_branch_sha_value | .[$tag].last_updated = $last_updated | .[$tag].latest = $latest | .[$tag].description = $description | .[$tag].last_updated_url = $last_updated_url | .[$tag].hide = $hide' <<< "${json}" | tee tags.json
+            git pull
+            git add .
+            if git commit -m "Update tags.json [skip ci]"; then
+              git push
+            fi
+          new_command_on_retry: |
+            git pull --rebase
+            git push
+
+  notify:
+    runs-on: ubuntu-22.04
+    if: always()
+    needs: [build, publish]
+    steps:
+      - name: Download Artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.package-version }}-results-linux-amd64
+
+      - name: Send Discord Notification
+        uses: nick-fields/retry@v3
+        env:
+          VERSION:          ${{ needs.build.outputs.version }}
+          STATUS:           ${{ needs.publish.result }}
+          DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK }}
+          COMMIT_MESSAGE:   ${{ github.event.head_commit.message }}
+          RUN_ID:           ${{ github.run_id }}
+          REPOSITORY:       ${{ github.repository }}
+          SHA:              ${{ github.sha }}
+          SERVER_URL:       ${{ github.server_url }}
+          IMAGE_TAG_BRANCH: ${{ needs.build.outputs.image-tag-branch }}
+          DISCORD_MENTIONS: ${{ vars.DISCORD_MENTIONS }}
+          PACKAGE_VERSION:  ${{ needs.build.outputs.package-version }}
+        with:
+          max_attempts: 3
+          timeout_minutes: 5
+          retry_wait_seconds: 30
+          command: |
+            [[ "${STATUS}" == "success" ]] && COLOR="3066993"
+            [[ "${STATUS}" != "success" ]] && MENTIONS="${DISCORD_MENTIONS}"
+            [[ ! -f "${PACKAGE_VERSION}-screenshot.png" ]] && [[ "${STATUS}" == "success" ]] && curl -fsSL --retry 3 "https://hotio.dev/img/pullio-background-sunglasses.png" --output "${PACKAGE_VERSION}-screenshot.png"
+            [[ ! -f "${PACKAGE_VERSION}-screenshot.png" ]] && [[ "${STATUS}" != "success" ]] && curl -fsSL --retry 3 "https://hotio.dev/img/pullio-background-crying.png" --output "${PACKAGE_VERSION}-screenshot.png"
+            json=$(jq -nc --arg     discord_mentions "${MENTIONS}" \
+                          --arg     title            "${IMAGE_TAG_BRANCH}" \
+                          --arg     url              "${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}" \
+                          --argjson color            "${COLOR:-15158332}" \
+                          --arg     commit_message   "\`\`\`${COMMIT_MESSAGE:----}\`\`\`" \
+                          --arg     commit_sha_link  "[${SHA:0:7}](${SERVER_URL}/${REPOSITORY}/commit/${SHA})" \
+                          --arg     version          "${VERSION:----}" \
+                          --arg     attachment       "attachment://${PACKAGE_VERSION}-screenshot.png" \
+                          --arg     timestamp        "$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')" \
+                          '{"content": $discord_mentions,
+                            "embeds": [
+                              {
+                                "title": $title,
+                                "url": $url,
+                                "color": $color,
+                                "fields": [
+                                  {
+                                    "name": "Commit Message",
+                                    "value": $commit_message
+                                  },
+                                  {
+                                    "name": "Commit SHA",
+                                    "value": $commit_sha_link,
+                                    "inline": true
+                                  },
+                                  {
+                                    "name": "Version",
+                                    "value": $version,
+                                    "inline": true
+                                  }
+                                ],
+                                "footer": {"text": "Powered by GitHub Actions"},
+                                "image": {"url": $attachment},
+                                "timestamp": $timestamp
+                              }
+                          ]}')
+            jq <<< "${json}"
+            curl -fsSL --retry 5 -H "Content-Type: multipart/form-data" -F "file=@${PACKAGE_VERSION}-screenshot.png" -F "payload_json=${json}" "${DISCORD_WEBHOOK}" > /dev/null
